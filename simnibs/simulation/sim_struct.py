@@ -638,6 +638,9 @@ class SimuList(object):
         self.solver_options = None
         self._anisotropy_type = 'scalar'
         self._postprocess = ['e', 'E', 'j', 'J']
+        
+        # new! 
+        self.custom_cond = None
 
     @property
     def type(self):
@@ -805,7 +808,64 @@ class SimuList(object):
 
         if self.anisotropy_type == 'scalar':
             logger.log(level, 'Using isotropic conductivities')
-            return simnibs.utils.cond_utils.cond2elmdata(mesh, cond_list)
+            
+            ### NEW ADDITION ###
+            cond_data = simnibs.utils.cond_utils.cond2elmdata(mesh, cond_list)
+            if self.custom_cond is None:
+                return cond_data
+            
+            # validate / normalize custom cond input
+            if isinstance(self.custom_cond, mesh_io.ElementData):
+                if self.custom_cond.nr_comp != 1:
+                    raise RuntimeError("'custom_cond' must be a scalar ElementData field")
+                custom_values = np.asarray(self.custom_cond.value, dtype=float).reshape(-1)
+            else:
+                custom_values = np.asarray(self.custom_cond, dtype=float).reshape(-1)
+
+            custom_full = None
+
+            # Case 1: custom conductivity already matches the mesh in this call
+            if custom_values.shape[0] == mesh.elm.nr:
+                custom_full = custom_values
+
+            # Case 2: custom conductivity is defined on self.mesh (typically pre-electrode mesh)
+            elif self.mesh is not None and custom_values.shape[0] == self.mesh.elm.nr:
+                src_is_bio_tet = (
+                    (self.mesh.elm.elm_type == 4) &
+                    (self.mesh.elm.tag1 > ElementTags.TH_START) &
+                    (self.mesh.elm.tag1 < ElementTags.ELECTRODE_RUBBER_START)
+                )
+                dst_is_bio_tet = (
+                    (mesh.elm.elm_type == 4) &
+                    (mesh.elm.tag1 > ElementTags.TH_START) &
+                    (mesh.elm.tag1 < ElementTags.ELECTRODE_RUBBER_START)
+                )
+                src_idx = np.flatnonzero(src_is_bio_tet)
+                dst_idx = np.flatnonzero(dst_is_bio_tet)
+
+                if src_idx.size != dst_idx.size:
+                    raise RuntimeError(
+                        "Could not map custom conductivity to simulation mesh: "
+                        f"biological tetrahedra mismatch ({src_idx.size} != {dst_idx.size})"
+                    )
+
+                custom_full = np.zeros(mesh.elm.nr, dtype=float)
+                custom_full[dst_idx] = custom_values[src_idx]
+
+            else:
+                raise RuntimeError(
+                    "'custom_cond' must have same number of elements as either "
+                    "the provided mesh or self.mesh"
+                )
+
+            # Keep original values where custom_cond is 0 or non-finite
+            new_cond_mask = (custom_full != 0) & np.isfinite(custom_full)
+            cond_data.value[new_cond_mask] = custom_full[new_cond_mask]
+            return cond_data
+                
+            
+            ### END NEW ADDITION ###
+
 
         elif self.anisotropy_type == 'dir':
             logger.log(
@@ -952,7 +1012,6 @@ class SimuList(object):
         mesh_io.write_geo_triangles(m.elm[idx, :3]-1,
                                     m.nodes.node_coord, fn_out,
                                     name='scalp', mode='ba')
-
 
 class TMSLIST(SimuList):
     """List of TMS coil position
@@ -1721,6 +1780,7 @@ class TDCSLIST(SimuList):
 
         mesh_elec, electrode_surfaces = self._place_electrodes()
         cond = self.cond2elmdata(mesh_elec)
+
         v = fem.tdcs(mesh_elec, cond, self.currents,
                      np.unique(electrode_surfaces),
                      solver_options=self.solver_options,

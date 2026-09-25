@@ -39,6 +39,7 @@ import inspect
 from ..mesh_tools import mesh_io
 from .sim_struct import SimuList
 from . import fem
+from .fem import _validate_scalp_tag
 from simnibs.utils.simnibs_logger import logger
 
 FIELD_NAME = {"v": "v", "E": "E", "e": "magnE", "J": "J", "j": "magnJ"}
@@ -578,7 +579,7 @@ def run_tms_gpc(poslist, fn_simu, cpus=1, tissues=[ElementTags.GM], eps=1e-2,
 
 def run_tcs_gpc(poslist, fn_simu, cpus=1, tissues=[2], eps=1e-2,
                 max_iter=1000, min_iter=2, data_poly_ratio=2,
-                regularization_factors=[1e-5]):
+                regularization_factors=[1e-5], scalp_tag=None):
     ''' Runs a tDCS gPC expansion
 
     Parameters
@@ -599,6 +600,9 @@ def run_tcs_gpc(poslist, fn_simu, cpus=1, tissues=[2], eps=1e-2,
         Minimum number of adaptive gPC expansion interations. Defaut:2
     data_poly_ratio(optional): int
         Ratio of number of new simulation per new polynomial. Default:2
+    scalp_tag: int or list of int, optional
+        Skin surface triangle tags used for electrode current calibration.
+        Defaults to scalp tags 5 and 1005.
 
     Returns
     --------
@@ -606,6 +610,7 @@ def run_tcs_gpc(poslist, fn_simu, cpus=1, tissues=[2], eps=1e-2,
         List of mesh file names
     '''
 
+    scalp_tag = _validate_scalp_tag(scalp_tag)
     poslist._prepare()
     fn_simu = os.path.abspath(os.path.expanduser(fn_simu))
     logger.info("Running a gPC expansion with tolerance: {0:1e}".format(eps))
@@ -627,6 +632,7 @@ def run_tcs_gpc(poslist, fn_simu, cpus=1, tissues=[2], eps=1e-2,
         electrode_surfaces,
         poslist.currents,
         roi=tissues,
+        scalp_tag=scalp_tag,
     )
     sampler.create_hdf5()
     # construct gPC model
@@ -824,13 +830,17 @@ class TDCSgPCSampler(gPCSampler):
         List with current values for each electrode (in A)
     roi: list of integers (Optional)
         List of tags defining the ROI. Default: [2]
+    scalp_tag: int or list of int, optional
+        Skin surface triangle tags used for electrode current calibration.
 
     """
 
-    def __init__(self, mesh, poslist, fn_hdf5, el_tags, el_currents, roi=[2]):
+    def __init__(self, mesh, poslist, fn_hdf5, el_tags, el_currents, roi=[2],
+                 scalp_tag=None):
         super(TDCSgPCSampler, self).__init__(mesh, poslist, fn_hdf5, roi=roi)
         self.el_tags = el_tags
         self.el_currents = el_currents
+        self.scalp_tag = _validate_scalp_tag(scalp_tag)
 
     def create_hdf5(self):
         super(TDCSgPCSampler, self).create_hdf5()
@@ -839,6 +849,10 @@ class TDCSgPCSampler(gPCSampler):
             f.create_dataset(
                 "el_currents", data=np.array(self.el_currents, dtype=float)
             )
+            if self.scalp_tag is not None:
+                f.create_dataset(
+                    "scalp_tag", data=np.array(self.scalp_tag, dtype=int)
+                )
 
     @classmethod
     def load_hdf5(cls, fn_hdf5):
@@ -846,13 +860,16 @@ class TDCSgPCSampler(gPCSampler):
         with h5py.File(fn_hdf5, "r") as f:
             el_tags = f["el_tags"][()].tolist()
             el_currents = f["el_currents"][()].tolist()
-        return cls(s.mesh, s.poslist, s.fn_hdf5, el_tags, el_currents, roi=s.roi)
+            scalp_tag = f["scalp_tag"][()].tolist() if "scalp_tag" in f else None
+        return cls(s.mesh, s.poslist, s.fn_hdf5, el_tags, el_currents,
+                   roi=s.roi, scalp_tag=scalp_tag)
 
     def run_simulation(self, parameters):
         poslist = self._update_poslist(parameters)
         random_vars = parameters
         cond = poslist.cond2elmdata(self.mesh)
-        v = fem.tdcs(self.mesh, cond, self.el_currents, self.el_tags, units="mm")
+        v = fem.tdcs(self.mesh, cond, self.el_currents, self.el_tags, units="mm",
+                     scalp_tag=self.scalp_tag)
 
         self.mesh.nodedata = [v]
         cropped = self.mesh.crop_mesh(self.roi)

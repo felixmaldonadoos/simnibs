@@ -1431,6 +1431,7 @@ def tdcs(
     n_workers=1,
     units="mm",
     solver_options=None,
+    scalp_tag=None,
 ):
     """Simulates a tDCS electric potential.
 
@@ -1445,6 +1446,9 @@ def tdcs(
     electrode_surface_tags: list
         A list of the indices of the surfaces where the dirichlet BC is to be
         applied.
+    scalp_tag: int or list of int, optional
+        Tags of the skin surface triangles used for electrode current calibration.
+        Defaults to the scalp surface tags 5 and 1005.
 
     Returns
     -------
@@ -1462,6 +1466,7 @@ def tdcs(
 
     assert np.isclose(np.sum(currents), 0), "Currents should sum to 0"
 
+    scalp_tag = _validate_scalp_tag(scalp_tag)
     ref_electrode = electrode_surface_tags[0]
     total_p = np.zeros(mesh.nodes.nr, dtype=float)
 
@@ -1469,11 +1474,13 @@ def tdcs(
     if n_workers == 1:
         for el_surf, el_c in zip(electrode_surface_tags[1:], currents[1:]):
             total_p += _sim_tdcs_pair(
-                mesh, cond, ref_electrode, el_surf, el_c, units, solver_options
+                mesh, cond, ref_electrode, el_surf, el_c, units, solver_options,
+                scalp_tag
             )
     else:
         args_list = [
-            (mesh, cond, ref_electrode, el_surf, el_c, units, solver_options)
+            (mesh, cond, ref_electrode, el_surf, el_c, units, solver_options,
+             scalp_tag)
             for el_surf, el_c in zip(electrode_surface_tags[1:], currents[1:])
         ]
         result = run_in_multiprocessing_pool(n_workers, _sim_tdcs_pair, args_list)
@@ -1482,7 +1489,20 @@ def tdcs(
     return mesh_io.NodeData(total_p, "v", mesh=mesh)
 
 
-def _sim_tdcs_pair(mesh, cond, ref_electrode, el_surf, el_c, units, solver_options):
+def _validate_scalp_tag(scalp_tag):
+    """Validate and copy the optional skin surface tags."""
+    if scalp_tag is None:
+        return None
+    tags = np.atleast_1d(np.asarray(scalp_tag))
+    if tags.ndim != 1 or not tags.size or tags.dtype.kind not in "iu":
+        raise ValueError(
+            "scalp_tag must be an integer or a non-empty sequence of integer tags"
+        )
+    return tags.tolist()
+
+
+def _sim_tdcs_pair(mesh, cond, ref_electrode, el_surf, el_c, units, solver_options,
+                   scalp_tag=None):
     logger.info("Simulating electrode pair {0} - {1}".format(ref_electrode, el_surf))
 
     s = TDCSFEMDirichlet(
@@ -1523,6 +1543,7 @@ def _sim_tdcs_pair(mesh, cond, ref_electrode, el_surf, el_c, units, solver_optio
         )
 
     v = mesh_io.NodeData(v, name="v", mesh=mesh)
+    scalp_tag_kwargs = {} if scalp_tag is None else {"scalp_tag": scalp_tag}
     flux = np.array(
         [
             _calc_flux_electrodes(
@@ -1533,6 +1554,7 @@ def _sim_tdcs_pair(mesh, cond, ref_electrode, el_surf, el_c, units, solver_optio
                     el_surf_index + ElementTags.SALINE_START,
                 ],
                 units=units,
+                **scalp_tag_kwargs,
             ),
             _calc_flux_electrodes(
                 v,
@@ -1542,6 +1564,7 @@ def _sim_tdcs_pair(mesh, cond, ref_electrode, el_surf, el_c, units, solver_optio
                     ref_electrode_index + ElementTags.SALINE_START,
                 ],
                 units=units,
+                **scalp_tag_kwargs,
             ),
         ]
     )
@@ -1571,6 +1594,9 @@ def _calc_flux_electrodes(
     m.elmdata = [cond]
     # Select mesh nodes wich are is in one electrode as well as the scalp
     # Triangles in scalp
+    if scalp_tag is None:
+        raise ValueError("Omit scalp_tag to use the default; do not pass None")
+    
     tr_scalp = m.elm.get_triangles(scalp_tag)
     if not np.any(tr_scalp):
         raise ValueError("Could not find skin surface")
